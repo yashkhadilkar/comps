@@ -52,6 +52,16 @@ Requires Node 22.
 | `STRIPE_WEBHOOK_SECRET` | Verifies that webhook calls really come from Stripe |
 | `NEXT_PUBLIC_APP_URL` | Public base URL of the app, used for Stripe success/cancel redirects |
 
+## Comparability Audit
+
+`/audit` (sidebar: "Comparability Audit") checks whether two companies' reported figures are genuinely comparable for a fiscal year: revenue, operating income, operating margin and net income. For each metric it checks fiscal year-end alignment, currency, XBRL definition and evidence, and returns one of `COMPARABLE`, `ADJUSTED`, `PARTIALLY_COMPARABLE`, `NOT_COMPARABLE` or `INSUFFICIENT_EVIDENCE`, with 10-K links, formulas, caveats, a review checklist and a Markdown export. All figures come from SEC XBRL via `get_financials`; margins go through the calculate engine and are re-verified. One bounded model call may add explanatory notes, which are dropped if they contain any figure not in the audit.
+
+Limitations: an evidence-backed comparability review, not a statutory audit. Annual 10-K US GAAP facts in USD only (no FX conversion, non-GAAP, segments or IFRS filers); periods are matched to the nearest fiscal year-end, not recalendarized; companies that do not report an operating income line (Nike) get `INSUFFICIENT_EVIDENCE` rather than an estimate. Audits do not count against research questions; they are limited to 10 per user per hour (in memory, per server process).
+
+Research answers that compare two or more companies also show a **Comparability review** above the answer: the same deterministic audit (no model call) for the most recent fiscal year the answer shows, with cautions, SEC links, the metrics not audited, and a link to the full audit. It is saved with the run and reappears when the thread is reopened; older runs show no review.
+
+Tests: `NODE_OPTIONS=--conditions=react-server npx tsx scripts/try-audit.ts`, `npx tsx scripts/try-research-audit.ts` (offline) and `NODE_OPTIONS=--conditions=react-server npx tsx --env-file=.env.local scripts/try-audit-live.ts NKE LULU 2024` (real SEC data and model).
+
 ## Team
 
 | Step | Owner |

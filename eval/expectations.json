@@ -1,0 +1,33 @@
+{
+  "$comment": "Comps quality expectations. Declare before the remaining Step 3/4 implementation is considered done. Do not loosen just to make a failing build pass.",
+  "project": "Comps",
+  "agent": {
+    "maxIterations": 6,
+    "agentDeadlineMs": 90000,
+    "routeMaxDurationMs": 120000,
+    "maxToolRetriesAfterFailure": 1,
+    "requiredAnswerFollowUps": 3
+  },
+  "grounding": {
+    "unknownCitationKeysAllowed": 0,
+    "requiredCitationResolutionRate": 1.0,
+    "allowEstimatedMissingFinancials": false,
+    "requirePeriodEndWhenFiscalYearEndsDiffer": true
+  },
+  "product": {
+    "freeSuccessfulQuestionsTotal": 3,
+    "proSuccessfulQuestionsPerUtcDay": 25,
+    "proPriceUsdOneTime": 19
+  },
+  "demo": {
+    "targetPrimaryAnswerWallClockMs": 60000,
+    "requiredLivePrimaryCases": 1,
+    "requiredLiveEdgeCases": 1
+  },
+  "gates": {
+    "lintMustPass": true,
+    "buildMustPass": true,
+    "browserConsoleErrorsMainFlowAllowed": 0,
+    "secretsAllowedInRepo": 0
+  }
+}

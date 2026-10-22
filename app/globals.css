@@ -1,12 +1,111 @@
 @import "tailwindcss";
 
+/* Design tokens. Warm Neutral light theme only: color-scheme stays light even when the OS prefers dark.
+   Text tiers are darkened slightly from the base palette so small text meets WCAG AA on every surface. */
+:root {
+  color-scheme: light;
+
+  --bg: #f7f5ef;
+  --bg-sidebar: #efeee6;
+  --bg-elevated: #ffffff;
+  --bg-subtle: #f2f1ea;
+  --bg-hover: #e8e7dd;
+
+  --border: #daddd3;
+  --border-subtle: #e4e5dc;
+  --border-strong: #c6cbbf;
+
+  --text-primary: #26372e;
+  --text-secondary: #4e5b52;
+  --text-muted: #5d6b61;
+  --text-faint: #64705e;
+
+  --accent: #305444;
+  --accent-hover: #264437;
+  --accent-soft: rgba(48, 84, 68, 0.08);
+
+  /* Semantic audit/status colors: restrained green, muted amber, muted red. */
+  --positive: #2f6b47;
+  --negative: #a23b3b;
+  --warning: #8a5b0e;
+
+  --sidebar-width: 60px;
+  --sidebar-width-open: 220px;
+  --topbar-height: 52px;
+  --content-max: 1120px;
+  --answer-max: 820px;
+}
+
 @theme inline {
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+
+  --color-canvas: var(--bg);
+  --color-sidebar: var(--bg-sidebar);
+  --color-raised: var(--bg-elevated);
+  --color-subtle: var(--bg-subtle);
+  --color-hover: var(--bg-hover);
+  --color-line: var(--border);
+  --color-line-subtle: var(--border-subtle);
+  --color-line-strong: var(--border-strong);
+  --color-ink: var(--text-primary);
+  --color-ink-2: var(--text-secondary);
+  --color-ink-3: var(--text-muted);
+  --color-ink-4: var(--text-faint);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-pos: var(--positive);
+  --color-neg: var(--negative);
+  --color-warn: var(--warning);
+}
+
+@theme {
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
 }
 
 body {
-  background: #f8fafc;
-  color: #0f172a;
+  background: var(--bg);
+  color: var(--text-primary);
   font-family: var(--font-sans), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(48, 84, 68, 0.16);
+}
+
+/* In the base layer so component classes (outline-none on the composer, which draws its own focus ring) win. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Thin, neutral scrollbars for wide tables and long pages. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Fades in streamed answer parts (tables, sources, follow-ups) as they appear. */
+@keyframes reveal-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.reveal { animation: reveal-in 240ms ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .reveal { animation: none; }
 }

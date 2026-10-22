@@ -14,8 +14,8 @@ Comps is a single Next.js app deployed as one service on Railway. The frontend, 
 
 1. The user submits a question. `/api/agent` checks the Supabase session, then checks usage: a free user must have fewer than 3 successful questions, and a Pro user fewer than 25 today. If not, it returns an upgrade or daily-limit message.
 2. The agent loop starts. Each turn, the LLM either picks a tool (Thought, then Action) or writes the final answer.
-3. The tool runs and its result goes back to the LLM as the Observation. Each step is streamed to the browser so the user sees the trace live.
-4. The loop stops when the LLM gives a final answer or hits the cap of 6 iterations.
+3. The tool runs and its result goes back to the LLM as the Observation. Each step is streamed to the browser as newline-delimited JSON so the user sees the trace live.
+4. The loop stops when the LLM gives a final answer or hits the cap of 6 iterations (8 for why/driver questions).
 5. The run (question, answer, trace, status) is saved to the `runs` table. Only successful runs count toward usage, so a failed question never uses up one of the user's questions.
 
 ## How the Pro upgrade flows through the system
@@ -30,24 +30,32 @@ Comps is a single Next.js app deployed as one service on Railway. The frontend, 
 | Table | Columns | Notes |
 |---|---|---|
 | `profiles` | `id` (= auth user id), `email`, `plan` (`free` or `pro`, default `free`), `pro_since`, `created_at` | Created automatically on signup |
-| `runs` | `id`, `user_id`, `question`, `answer`, `trace` (json), `status` (`success` or `failed`), `created_at` | One row per question. Usage limits are counted from this table |
+| `runs` | `id`, `user_id`, `thread_id` (nullable FK to `threads`, no cascade), `question`, `answer`, `trace` (json), `status` (`success` or `failed`), `created_at` | One row per question. Usage limits are counted from this table (never from threads) |
+| `threads` | `id`, `user_id` (FK `auth.users`), `title` (first question, max 120 chars), `created_at`, `updated_at` | One row per research conversation (migration `002_add_threads.sql`). History lists threads by `updated_at` |
 
-Row-level security is on for both tables, so a user can only read their own rows. Only the server (using the service key) can change `plan`.
+Row-level security is on for all three tables, so a user can only read their own rows. `threads` also has own-row insert/update policies (the app itself writes with the service key).
+
+**Threads flow** (`/api/agent`, optional `threadId` in the body): auth, validate question, if `threadId` is given check `threads.id` AND `user_id` (missing or foreign = 404), usage check, then create the thread (new conversation) or load the latest 3 successful runs of the thread as context, run the agent, insert the run with `thread_id`, bump `threads.updated_at` (best effort). The thread id is returned in the `X-Thread-Id` response header; NDJSON events are unchanged. Prior answers reach the model only as a bounded, citation-stripped context block that states it is not evidence (`lib/agent/context.ts`). Only the server (using the service key) can change `plan`.
+
+### Diagnostic ("Why?") questions
+
+Same ReAct loop, no extra stage. The prompt makes the order numbers-first: `lookup_ticker` then `get_financials` (revenue, operating income, gross profit and cost of revenue) then one batched `calculate`, and only then `search_news` with a query built from the years and metric just found (peer questions: one search per company, in parallel; recovery questions: decline and recovery periods searched separately). The iteration ceiling is 8 for these questions (`lib/agent/intent.ts`, wording match) and 6 otherwise; all derived metrics go into one `calculate` call and the per-phase searches run in parallel in one turn, so the typical run is 5 iterations, 20 to 35 s. Final-step wording never exposes the step budget. Filings stay the source of every figure; `news-N` keys support only reported drivers. A failed search leaves the quantified answer intact. See SPEC section 6A.
 
 ## Agent tools
 
 | Tool | Source | What it returns |
 |---|---|---|
 | `lookup_ticker` | SEC company tickers file | Fuzzy-matches the name or ticker, so typos like "Nikee" still work. Returns the top 3 matches with a confidence score, or "not found". One clear match gets used (and the answer says "assuming you meant..."), close matches get sent back to the user to pick |
-| `get_financials` | SEC EDGAR company facts API | Annual values for a metric (revenue, gross profit, operating income, net income, operating cash flow, inventory), each with its fiscal year, period end date, and the filing it came from |
+| `get_financials` | SEC EDGAR company facts API | Annual values for a metric (revenue, cost of revenue, gross profit, operating income, net income, operating cash flow, inventory), each with its fiscal year, period end date, and the filing it came from |
 | `calculate` | Runs locally | Margins, growth rates, and other math, so the model never does arithmetic in its head. Uses a safe math parser, never `eval` |
-| `search_news` | Tavily | Recent headlines and links to explain a change in the numbers |
+| `search_news` | Tavily | Headlines and links to explain a change in numbers already quantified from filings. Takes an optional calendar-year window (`from_year`, `to_year`) so it can reach the period being explained; defaults to the last 12 months |
+| `final_answer` | Ends every run | The structured answer: text with `[n]` citation markers, comparison tables, sources, 3 follow-up questions, and notes. Citation keys the tools never returned are dropped, so every source shown is real |
 
 ## SEC data gotchas (for whoever builds the tools)
 
 - **SEC requires a User-Agent header** with a name and email on every request, and allows about 10 requests a second. Requests without it get blocked.
-- **Companies tag the same metric differently.** Revenue might be `Revenues` for one company and `RevenueFromContractWithCustomerExcludingAssessedTax` for another. `get_financials` should try a short list of tags per metric and use the first one that has data.
-- **The same number appears in multiple filings.** A 10-K repeats the prior two years, and restated values show up later. Keep only annual 10-K values (`fp = FY`) and take the most recently filed value for each fiscal year.
+- **Companies tag the same metric differently.** Revenue might be `Revenues` for one company and `RevenueFromContractWithCustomerExcludingAssessedTax` for another. `get_financials` tries a short list of tags per metric and fills each period from the first tag that has it, since companies also switch tags over time.
+- **The same number appears in multiple filings, and `fy` is not the data point's year.** A 10-K repeats the prior two years, and restated values show up later. In the SEC data, `fy` and `fp` describe the *filing*: a FY2024 10-K reports FY2023 and FY2022 figures too, all tagged `fy = 2024`. So keep only 10-K values for roughly 12-month periods, group them by period **end date**, take the most recently filed value for each end date, and derive the fiscal year label from the end date.
 - **Fiscal years end in different months.** Nike's ends in May and Lululemon's in early February, and some companies (like Under Armour) have changed theirs. Always return the period end date so the answer can label it.
 
 ## Repo structure
@@ -63,12 +71,20 @@ app/
 lib/
   agent/loop.ts              the ReAct loop, iteration cap, retries
   agent/prompt.ts            system prompt and guardrails
-  agent/tools/               lookupTicker, getFinancials, calculate, searchNews
+  agent/tools/               lookupTicker, getFinancials, calculate, searchNews, index (executor, citations)
+  agent/types.ts             shared types for the trace, answer, and streamed events
+  agent/runStream.ts         NDJSON stream and best-effort run saving for /api/agent (plus the optional `audit` event)
+  audit/                     comparability audit: contract, deterministic engine, SEC retrieval, /api/audit handler,
+                             research enrichment (research.ts) saved as runs.trace.audit
+  agent/clarify.ts           rewrites a question for an ambiguous-name choice (server and browser)
+  agent/sec.ts               SEC EDGAR client with caching
   supabase/                  browser and server clients
   usage.ts                   free and Pro limit checks
   stripe.ts
 supabase/migrations/         tables and row-level security
-docs/                        PRD.md, ARCHITECTURE.md
+docs/                        PRD.md, ARCHITECTURE.md, agent-notes.md
+scripts/                     test scripts for the agent and tools (try-*.ts; the offline ones need no API key)
+eval/                        expectations.json, cases.json, and the gate order in README.md
 .env.example
 README.md
 ```

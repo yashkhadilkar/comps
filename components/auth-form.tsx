@@ -55,64 +55,76 @@ export function AuthForm({ mode, initialError }: { mode: Mode; initialError?: st
     }
   }
 
+  const inputClass =
+    "mt-1.5 w-full rounded-md border border-line bg-canvas px-3 py-2 text-sm text-ink outline-none transition-colors duration-150 placeholder:text-ink-4 focus:border-line-strong focus:ring-2 focus:ring-accent-soft";
+
   return (
-    <main className="flex flex-1 items-center justify-center px-4 py-12">
-      <div className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h1 className="text-xl font-semibold">{isLogin ? "Log in to Comps" : "Create your account"}</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          {isLogin ? "Welcome back." : "Start with 3 free questions."}
-        </p>
+    <main className="flex min-h-dvh flex-1 items-center justify-center px-4 py-12">
+      <div className="w-full max-w-sm">
+        <Link
+          href="/"
+          aria-label="Comps"
+          className="mx-auto mb-6 flex h-10 w-10 items-center justify-center rounded-md border border-line bg-raised text-base font-semibold text-ink"
+        >
+          C
+        </Link>
+        <div className="rounded-lg border border-line bg-raised p-6">
+          <h1 className="text-lg font-semibold text-ink">{isLogin ? "Log in to Comps" : "Create your account"}</h1>
+          <p className="mt-1 text-[13px] text-ink-3">
+            {isLogin ? "Welcome back." : "Start with 3 free questions."}
+          </p>
 
-        <form onSubmit={handleSubmit} className="mt-6 space-y-4">
-          <label className="block">
-            <span className="text-sm font-medium text-slate-700">Email</span>
-            <input
-              type="email"
-              required
-              autoComplete="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200"
-            />
-          </label>
-          <label className="block">
-            <span className="text-sm font-medium text-slate-700">Password</span>
-            <input
-              type="password"
-              required
-              minLength={6}
-              autoComplete={isLogin ? "current-password" : "new-password"}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-2 focus:ring-slate-200"
-            />
-          </label>
+          <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+            <label className="block">
+              <span className="text-xs font-medium text-ink-2">Email</span>
+              <input
+                type="email"
+                required
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className={inputClass}
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-ink-2">Password</span>
+              <input
+                type="password"
+                required
+                minLength={6}
+                autoComplete={isLogin ? "current-password" : "new-password"}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className={inputClass}
+              />
+            </label>
 
-          {error && (
-            <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
-              {error}
-            </p>
-          )}
-          {message && (
-            <p role="status" className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-              {message}
-            </p>
-          )}
+            {error && (
+              <p role="alert" className="rounded-md border border-neg/40 bg-neg/10 px-3 py-2 text-[13px] text-neg">
+                {error}
+              </p>
+            )}
+            {message && (
+              <p role="status" className="rounded-md border border-accent/30 bg-accent-soft px-3 py-2 text-[13px] text-accent">
+                {message}
+              </p>
+            )}
 
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
-          >
-            {loading ? "Please wait…" : isLogin ? "Log in" : "Sign up"}
-          </button>
-        </form>
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full rounded-md bg-accent px-4 py-2 text-sm font-medium text-canvas transition-colors duration-150 hover:bg-accent-hover disabled:opacity-50"
+            >
+              {loading ? "Please wait…" : isLogin ? "Log in" : "Sign up"}
+            </button>
+          </form>
+        </div>
 
-        <p className="mt-4 text-center text-sm text-slate-500">
+        <p className="mt-4 text-center text-[13px] text-ink-3">
           {isLogin ? "New to Comps? " : "Already have an account? "}
           <Link
             href={isLogin ? "/signup" : "/login"}
-            className="font-medium text-slate-900 underline-offset-2 hover:underline"
+            className="font-medium text-ink-2 underline-offset-2 hover:text-ink hover:underline"
           >
             {isLogin ? "Sign up" : "Log in"}
           </Link>
