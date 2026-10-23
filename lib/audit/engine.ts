@@ -1,7 +1,27 @@
 // Deterministic comparability engine. Pure: takes already-retrieved SEC facts and returns the audit. No network,
 // no model. Every status, figure and adjustment is decided here; the model may only add validated notes afterwards.
 import { evaluateExpression } from "../agent/tools/calculate";
-import { formatMoney } from "../agent/tools/getFinancials";
+import { formatMoney, TAGS } from "../agent/tools/getFinancials";
+import {
+  assembleIntegrity,
+  coverageChecks,
+  currencyCheck,
+  definitionCheck,
+  evidenceCheck,
+  findConflict,
+  makeCheck,
+  mergeChecks,
+  notApplicableSeries,
+  periodAlignmentCheck,
+  periodDurationCheck,
+  provenanceCheck,
+  revisionCheck,
+  seriesChecks,
+  unknownSeries,
+  type PriorReport,
+  type ShortPeriod,
+} from "./integrity";
+import { READINESS_LABEL } from "./report";
 import type {
   AuditAdjustment,
   AuditCheck,
@@ -12,14 +32,29 @@ import type {
   ComparabilityAudit,
   ComparabilityStatus,
   EvidenceQuality,
+  IntegrityCheck,
+  IntegrityCheckId,
   MetricAudit,
+  MetricIntegrity,
+  Readiness,
 } from "./types";
 
 export type ReportedMetric = "revenue" | "operating_income" | "net_income";
 export const REPORTED_METRICS: ReportedMetric[] = ["revenue", "operating_income", "net_income"];
 
-// One annual fact as get_financials returns it.
-export type FactRow = { fiscalYear: number; periodEnd: string; value: number; form: string; filed: string; tag: string; citationKey: string };
+// One annual fact as get_financials returns it. `periodStart` is added by the audit's own retrieval (retrieve.ts)
+// from the same XBRL fact; get_financials itself does not return it.
+export type FactRow = {
+  fiscalYear: number;
+  periodEnd: string;
+  value: number;
+  form: string;
+  filed: string;
+  tag: string;
+  citationKey: string;
+  periodStart?: string;
+  priorReports?: PriorReport[]; // earlier filings of the same concept and period; absent when not retrieved
+};
 export type FilingRef = { url: string; form: string; filed: string };
 
 export type CompanyData = {
@@ -27,12 +62,17 @@ export type CompanyData = {
   metrics: Record<ReportedMetric, FactRow[]>;
   nonUsdUnits: Partial<Record<ReportedMetric, string[]>>; // set when the metric exists only in a non-USD unit
   filings: Record<string, FilingRef>; // accession -> filing
+  shortPeriods?: ShortPeriod[]; // sub-annual periods between annual windows (fiscal year-end transitions)
   error?: string; // retrieval failed for the whole company
 };
 
+// Years of a multi-year research answer, so each company's own series is checked; "unknown" when the research
+// spans several years it does not name. Absent for a single-period audit.
+export type SeriesScope = number[] | "unknown";
+
 const DAY_MS = 24 * 60 * 60 * 1000;
-export const ALIGNED_DAYS = 31; // fiscal year-ends within a month are treated as the same period
-export const PARTIAL_DAYS = 183; // beyond half a year apart the periods are not comparable
+export const ALIGNED_DAYS = 31; // fiscal year-ends within a month: no realignment checklist item
+export const PARTIAL_DAYS = 183; // label-matched years further apart than this are realigned to the nearest year
 
 const LABELS: Record<AuditMetricId, string> = {
   revenue: "Revenue",
@@ -48,20 +88,6 @@ const DEFINITIONS: Record<AuditMetricId, string> = {
   operating_margin: "Operating income divided by revenue for the same fiscal period, times 100. Computed by the calculate engine.",
   net_income: "Net income (loss) attributable to the company, as reported in the 10-K (us-gaap NetIncomeLoss, ProfitLoss as fallback).",
 };
-
-// Concept pairs that are not like-for-like even though both are valid GAAP lines.
-const DEFINITION_CONFLICTS: { metric: ReportedMetric; tags: [string, string]; note: string }[] = [
-  {
-    metric: "revenue",
-    tags: ["RevenueFromContractWithCustomerIncludingAssessedTax", "RevenueFromContractWithCustomerExcludingAssessedTax"],
-    note: "One company reports revenue including assessed (excise/sales) taxes and the other excluding them.",
-  },
-  {
-    metric: "net_income",
-    tags: ["ProfitLoss", "NetIncomeLoss"],
-    note: "One company's figure is ProfitLoss (includes noncontrolling interests) and the other's is NetIncomeLoss (attributable to the parent).",
-  },
-];
 
 const SEVERITY: Record<ComparabilityStatus, number> = {
   COMPARABLE: 0,
@@ -159,8 +185,10 @@ function emptyValue(ticker: string, unit: string, basis: AuditValue["reportingBa
     unit,
     fiscalYear: null,
     periodEnd: null,
+    periodStart: null,
     periodType: "annual",
     reportingBasis: basis,
+    sourceBasis: "UNAVAILABLE",
     evidence: [],
   };
 }
@@ -170,27 +198,34 @@ function quality(values: AuditValue[]): EvidenceQuality {
   return n === values.length ? "VERIFIED" : n > 0 ? "PARTIAL" : "UNVERIFIED";
 }
 
-function periodStatus(p: PeriodChoice): { status: ComparabilityStatus; check: AuditCheck; caveat?: string } {
+// The legacy status follows the V2 period-alignment check: an ordinary fiscal-calendar difference (INFO) stays
+// comparable and is disclosed; only a materially partial overlap or a different period downgrades it.
+function periodStatus(p: PeriodChoice, alignment: IntegrityCheck): { status: ComparabilityStatus; check: AuditCheck; caveat?: string } {
   if (!p.a || !p.b || p.gapDays === null) {
     return { status: "INSUFFICIENT_EVIDENCE", check: { id: "period", passed: false, detail: "No matching annual period for both companies." } };
   }
   const ends = `${p.a.periodEnd} vs ${p.b.periodEnd}`;
-  if (p.gapDays <= ALIGNED_DAYS) {
+  const detail = `Fiscal year-ends ${ends} are ${p.gapDays} days apart. ${alignment.finding.split("; ").slice(1).join("; ")}`.trim();
+  if (alignment.status === "PASS" || alignment.status === "INFO") {
     return {
       status: p.realigned ? "ADJUSTED" : "COMPARABLE",
-      check: { id: "period", passed: true, detail: `Fiscal year-ends ${ends} are ${p.gapDays} days apart (within ${ALIGNED_DAYS}).` },
+      check: { id: "period", passed: true, detail: alignment.status === "PASS" ? `Fiscal year-ends ${ends} are ${p.gapDays} days apart.` : detail },
+      caveat:
+        alignment.status === "INFO"
+          ? `Fiscal years end ${p.gapDays} days apart (${ends}). Both are annual periods with most months in common: an ordinary fiscal-calendar difference, usable for annual benchmarking, but the windows are not identical.`
+          : undefined,
     };
   }
-  if (p.gapDays <= PARTIAL_DAYS) {
+  if (alignment.status === "CAUTION") {
     return {
       status: "PARTIALLY_COMPARABLE",
-      check: { id: "period", passed: false, detail: `Fiscal year-ends ${ends} are ${p.gapDays} days apart.` },
+      check: { id: "period", passed: false, detail },
       caveat: `Fiscal years end ${p.gapDays} days apart (${ends}), so the periods overlap only partly. Seasonality and macro conditions may differ between the two windows.`,
     };
   }
   return {
     status: "NOT_COMPARABLE",
-    check: { id: "period", passed: false, detail: `Fiscal year-ends ${ends} are ${p.gapDays} days apart.` },
+    check: { id: "period", passed: false, detail },
     caveat: `The closest available fiscal years end ${p.gapDays} days apart (${ends}); they are not the same economic period.`,
   };
 }
@@ -208,7 +243,27 @@ function realignmentAdjustment(p: PeriodChoice, b: CompanyData, evidence: AuditE
   };
 }
 
-function auditReported(metric: ReportedMetric, a: CompanyData, b: CompanyData, p: PeriodChoice): MetricAudit {
+const notChecked = (id: IntegrityCheckId, title: string, ids: string[]) =>
+  makeCheck({ id, critical: true, status: "NOT_ASSESSED", title, finding: "Not checked: a value is missing.", implication: "Checked only once both values exist.", evidenceIds: ids });
+
+function historyChecks(metric: ReportedMetric, sides: CompanyData[], series: SeriesScope | undefined): IntegrityCheck[] {
+  if (!series) return [notApplicableSeries()];
+  if (series === "unknown") return [unknownSeries()];
+  return sides.flatMap((d) =>
+    seriesChecks(
+      d.company.ticker,
+      d.metrics[metric].map((r) => ({ fiscalYear: r.fiscalYear, start: r.periodStart ?? null, end: r.periodEnd, tag: r.tag, accession: r.citationKey })),
+      series,
+      d.shortPeriods ?? [],
+      (accn) => {
+        const f = d.filings[accn];
+        return f ? { label: `${d.company.ticker} ${f.form} (filed ${f.filed})`, url: f.url, accession: accn } : null;
+      },
+    ),
+  );
+}
+
+function auditReported(metric: ReportedMetric, a: CompanyData, b: CompanyData, p: PeriodChoice, series?: SeriesScope): MetricAudit {
   const checks: AuditCheck[] = [];
   const caveats: string[] = [];
   const adjustments: AuditAdjustment[] = [];
@@ -229,15 +284,19 @@ function auditReported(metric: ReportedMetric, a: CompanyData, b: CompanyData, p
       currency: "USD",
       fiscalYear: row.fiscalYear,
       periodEnd: row.periodEnd,
+      periodStart: row.periodStart ?? null,
+      sourceBasis: "DIRECT_REPORTED",
       evidence: evidenceFor(d, row),
     } satisfies AuditValue;
   });
+  const ids = values.flatMap((v) => v.evidence.map((e) => e.sourceId));
 
   // Currency: only USD facts are retrieved. A metric that exists only in another currency cannot be converted
   // without a documented rate, so it is not comparable rather than silently missing.
-  const currencyIssues = sides
-    .map(({ d }, i) => (!rows[i] && d.nonUsdUnits[metric]?.length ? `${d.company.ticker} reports ${LABELS[metric].toLowerCase()} in ${d.nonUsdUnits[metric]!.join(", ")}` : null))
-    .filter((x): x is string => !!x);
+  const nonUsd = sides
+    .map(({ d }, i) => (!rows[i] && d.nonUsdUnits[metric]?.length ? { ticker: d.company.ticker, units: d.nonUsdUnits[metric]! } : null))
+    .filter((x): x is { ticker: string; units: string[] } => !!x);
+  const currencyIssues = nonUsd.map((n) => `${n.ticker} reports ${LABELS[metric].toLowerCase()} in ${n.units.join(", ")}`);
   if (currencyIssues.length) {
     status = "NOT_COMPARABLE";
     checks.push({ id: "currency", passed: false, detail: `${currencyIssues.join("; ")}, not USD.` });
@@ -246,17 +305,19 @@ function auditReported(metric: ReportedMetric, a: CompanyData, b: CompanyData, p
     checks.push({ id: "currency", passed: rows.every(Boolean), detail: rows.every(Boolean) ? "Both values are reported in USD." : "Currency not established for a missing value." });
   }
 
-  // Evidence
-  const missing = sides.filter((_, i) => !rows[i] && !currencyIssues.some((c) => c.startsWith(sides[i].d.company.ticker + " ")));
+  // Evidence. Missing SEC Company Facts data is a coverage gap of the data source, not proof the filing omits it.
+  const missing = sides.filter((_, i) => !rows[i] && !nonUsd.some((n) => n.ticker === sides[i].d.company.ticker));
+  const missingReasons: { ticker: string; reason: string }[] = [];
   if (missing.length) {
     status = worst(status, "INSUFFICIENT_EVIDENCE");
     for (const { d } of missing) {
       const why = d.error
         ? `${d.company.ticker}: data retrieval failed (${d.error}).`
         : metric === "operating_income" && d.metrics[metric].length === 0
-          ? `${d.company.ticker} does not report an operating income line (us-gaap OperatingIncomeLoss) in its 10-K XBRL data. It is not estimated.`
-          : `${d.company.ticker}: no annual ${LABELS[metric].toLowerCase()} fact for the selected period.`;
+          ? `${d.company.ticker}: no us-gaap OperatingIncomeLoss fact in SEC Company Facts for any year retrieved. The 10-K may present operating results under another line; this is a structured-data gap, and the figure is not estimated.`
+          : `${d.company.ticker}: no annual ${LABELS[metric].toLowerCase()} fact for the selected period in SEC Company Facts (us-gaap ${TAGS[metric].join(", ")}).`;
       caveats.push(why);
+      missingReasons.push({ ticker: d.company.ticker, reason: why });
     }
   }
   const unsourced = values.filter((v) => v.reportedValue !== null && v.evidence.length === 0);
@@ -271,30 +332,56 @@ function auditReported(metric: ReportedMetric, a: CompanyData, b: CompanyData, p
   });
   if (unsourced.length) status = worst(status, "INSUFFICIENT_EVIDENCE");
 
+  const integrityChecks: IntegrityCheck[] = [
+    evidenceCheck(values, missingReasons, nonUsd.map((n) => n.ticker), ids),
+    currencyCheck(values, nonUsd, ids),
+  ];
+
   if (rows[0] && rows[1]) {
-    const per = periodStatus(p);
+    const sideOf = (i: number) => ({ ticker: sides[i].d.company.ticker, start: rows[i]!.periodStart ?? null, end: rows[i]!.periodEnd });
+    const alignment = periodAlignmentCheck(sideOf(0), sideOf(1), ids);
+    const per = periodStatus(p, alignment);
     status = worst(status, per.status);
     checks.push(per.check);
     if (per.caveat) caveats.push(per.caveat);
     const adj = realignmentAdjustment(p, b, values[1].evidence);
     if (adj) adjustments.push(adj);
 
-    // Definition: same or equivalent XBRL concept
+    // Definition: a known conflict is flagged; a different concept is a review signal, never assumed equivalent.
     const [ta, tb] = [rows[0].tag, rows[1].tag];
-    const conflict = DEFINITION_CONFLICTS.find((c) => c.metric === metric && c.tags.includes(ta) && c.tags.includes(tb) && ta !== tb);
+    const conflict = findConflict(metric, ta, tb);
     if (conflict) {
       status = worst(status, "PARTIALLY_COMPARABLE");
       caveats.push(conflict.note);
       checks.push({ id: "definition", passed: false, detail: `${a.company.ticker}: ${ta}; ${b.company.ticker}: ${tb}.` });
     } else if (ta !== tb) {
-      caveats.push(`Different XBRL concepts (${a.company.ticker}: ${ta}; ${b.company.ticker}: ${tb}). Both are US GAAP ${LABELS[metric].toLowerCase()} lines; confirm scope in the filings.`);
-      checks.push({ id: "definition", passed: true, detail: "Different but equivalent revenue concepts." });
+      caveats.push(`Different XBRL concepts (${a.company.ticker}: ${ta}; ${b.company.ticker}: ${tb}). Both are US GAAP ${LABELS[metric].toLowerCase()} lines, but their equivalence is not established; confirm scope in the filings.`);
+      checks.push({ id: "definition", passed: false, detail: `Different concepts (${ta} vs ${tb}); equivalence not established.` });
     } else {
       checks.push({ id: "definition", passed: true, detail: `Both report ${ta}.` });
     }
-  }
 
-  return finish(metric, values, adjustments, checks, status, caveats);
+    integrityChecks.push(
+      alignment,
+      periodDurationCheck([sideOf(0), sideOf(1)], ids),
+      definitionCheck(metric, { ticker: a.company.ticker, tag: ta }, { ticker: b.company.ticker, tag: tb }, ids),
+    );
+  } else {
+    integrityChecks.push(
+      notChecked("period_alignment", "Fiscal period alignment", ids),
+      notChecked("period_duration", "Period length", ids),
+      notChecked("definition", "Metric definition (XBRL concept)", ids),
+    );
+  }
+  const revisions = revisionCheck(
+    LABELS[metric],
+    sides.map(({ d }, i) => ({ ticker: d.company.ticker, row: rows[i] })),
+    ids,
+  );
+  integrityChecks.push(provenanceCheck(values, ids), ...historyChecks(metric, [a, b], series), ...coverageChecks(revisions));
+
+  const integrity = assembleIntegrity(LABELS[metric], [a.company.ticker, b.company.ticker], values, integrityChecks);
+  return finish(metric, values, adjustments, checks, status, caveats, integrity);
 }
 
 function finish(
@@ -304,6 +391,7 @@ function finish(
   checks: AuditCheck[],
   status: ComparabilityStatus,
   caveats: string[],
+  integrity: MetricIntegrity,
 ): MetricAudit {
   const label = LABELS[metricId];
   const explanation =
@@ -329,6 +417,7 @@ function finish(
     explanation,
     requiresHumanReview: status !== "COMPARABLE",
     aiNotes: [],
+    integrity,
   };
 }
 
@@ -338,13 +427,24 @@ function auditMargin(revenue: MetricAudit, opInc: MetricAudit): MetricAudit {
   const caveats: string[] = [];
   const adjustments: AuditAdjustment[] = [];
   let status = worst(revenue.status, opInc.status);
+  const formulaNotes: string[] = [];
+  let formulaFailed = false;
 
   const values = revenue.values.map((rv, i) => {
     const ov = opInc.values[i];
     const base = emptyValue(rv.ticker, "percent", "Derived from US GAAP inputs");
     const evidence = [...rv.evidence, ...ov.evidence.filter((e) => !rv.evidence.some((x) => x.sourceId === e.sourceId))];
     if (rv.reportedValue === null || ov.reportedValue === null) return { ...base, evidence: [] };
+    if (rv.periodEnd !== ov.periodEnd) {
+      // Defensive: both inputs come from the same period selection, so this should not happen.
+      formulaFailed = true;
+      formulaNotes.push(`${rv.ticker}: inputs come from different periods (${rv.periodEnd} vs ${ov.periodEnd}).`);
+      checks.push({ id: "calculation", passed: false, detail: `${rv.ticker}: mixed fiscal windows.` });
+      return { ...base, evidence };
+    }
     if (rv.reportedValue === 0) {
+      formulaFailed = true;
+      formulaNotes.push(`${rv.ticker}: revenue is zero, so the ratio is undefined.`);
       caveats.push(`${rv.ticker}: revenue is zero, so operating margin is undefined.`);
       checks.push({ id: "calculation", passed: false, detail: `${rv.ticker}: zero denominator.` });
       return { ...base, evidence };
@@ -352,6 +452,8 @@ function auditMargin(revenue: MetricAudit, opInc: MetricAudit): MetricAudit {
     const formula = `${ov.reportedValue} / ${rv.reportedValue} * 100`;
     const r = evaluateExpression(formula);
     if ("error" in r) {
+      formulaFailed = true;
+      formulaNotes.push(`${rv.ticker}: ${r.error}.`);
       checks.push({ id: "calculation", passed: false, detail: `${rv.ticker}: ${r.error}` });
       return { ...base, evidence };
     }
@@ -366,10 +468,13 @@ function auditMargin(revenue: MetricAudit, opInc: MetricAudit): MetricAudit {
     };
     const v = verifyDerivation(adj, [ov.reportedValue, rv.reportedValue]);
     if (!v.ok) {
+      formulaFailed = true;
+      formulaNotes.push(`${rv.ticker}: rejected (${v.reason}).`);
       checks.push({ id: "calculation", passed: false, detail: `${rv.ticker}: rejected (${v.reason}).` });
       return { ...base, evidence };
     }
     adjustments.push(adj);
+    formulaNotes.push(`${rv.ticker}: ${formula} = ${adj.outputDisplay}.`);
     checks.push({ id: "calculation", passed: true, detail: `${rv.ticker}: ${formula} = ${r.result} (re-verified).` });
     return {
       ...base,
@@ -379,6 +484,8 @@ function auditMargin(revenue: MetricAudit, opInc: MetricAudit): MetricAudit {
       currency: "USD",
       fiscalYear: rv.fiscalYear,
       periodEnd: rv.periodEnd,
+      periodStart: rv.periodStart ?? null,
+      sourceBasis: "DERIVED",
       evidence,
     } satisfies AuditValue;
   });
@@ -394,29 +501,65 @@ function auditMargin(revenue: MetricAudit, opInc: MetricAudit): MetricAudit {
   if (!checks.some((c) => c.id === "calculation")) {
     checks.push({ id: "calculation", passed: false, detail: "Not computed: inputs missing." });
   }
-  return finish("operating_margin", values, adjustments, checks, status, caveats);
+
+  // Integrity: the formula check, plus every input check inherited (worst of revenue and operating income).
+  const ids = new Set(values.flatMap((v) => v.evidence.map((e) => e.sourceId)));
+  const computed = values.every((v) => v.normalizedValue !== null);
+  const formulaCheck = makeCheck({
+    id: "formula",
+    critical: true,
+    title: "Formula integrity",
+    status: formulaFailed ? "FAIL" : computed ? "PASS" : "NOT_ASSESSED",
+    finding: computed
+      ? `${formulaNotes.join(" ")} Same canonical formula for both: OperatingIncomeLoss / revenue x 100, inputs from the same fiscal period, USD over USD.`
+      : `${formulaNotes.join(" ")}${formulaFailed ? "" : `${formulaNotes.length ? " " : ""}Not computed for ${values.filter((v) => v.normalizedValue === null).map((v) => v.ticker).join(", ")}: an input is missing.`}`,
+    implication: formulaFailed
+      ? "The ratio cannot be supported for at least one company; no substitute value is produced."
+      : computed
+        ? "Re-evaluated by the calculate engine from the sourced inputs."
+        : "Depends on the missing input.",
+    evidenceIds: [...ids],
+    action: formulaFailed ? "Check the inputs in the filing; the ratio is withheld until they are valid." : null,
+  });
+  const inputs = [revenue.integrity!, opInc.integrity!];
+  const key = (c: IntegrityCheck) => `${c.id}|${c.ticker ?? ""}`;
+  const inheritedKeys = [...new Set(inputs.flatMap((x) => x.checks.filter((c) => !["provenance", "accounting_policy"].includes(c.id)).map(key)))];
+  const inherited = inheritedKeys.map((k) => {
+    const found = inputs.map((x, i) => ({ c: x.checks.find((c) => key(c) === k), p: i === 0 ? "Revenue" : "Operating income" })).filter((x) => x.c);
+    const merged = mergeChecks(found.map((x) => x.c!), found.map((x) => x.p));
+    return { ...merged, evidenceIds: merged.evidenceIds.filter((id) => ids.has(id)) };
+  });
+  const integrity = assembleIntegrity(LABELS.operating_margin, values.map((v) => v.ticker), values, [
+    formulaCheck,
+    ...inherited.filter((c) => c.id !== "revisions"),
+    provenanceCheck(values, [...ids]),
+    ...coverageChecks(inherited.find((c) => c.id === "revisions") ?? null),
+  ]);
+  return finish("operating_margin", values, adjustments, checks, status, caveats, integrity);
 }
 
 // ---- Whole audit --------------------------------------------------------------------------------------------------
 
 const LIMITATIONS = [
-  "This is an evidence-backed comparability review of SEC XBRL data, not a statutory financial audit.",
-  "Only annual 10-K US GAAP facts in USD are used. Non-GAAP measures, segment data and IFRS filers (20-F) are out of scope.",
+  "This is an evidence-backed comparison integrity review of SEC XBRL data, not a statutory financial audit.",
+  "Only annual 10-K US GAAP facts in USD are used. Non-GAAP measures, segment data, company-specific extension concepts and IFRS filers (20-F) are out of scope.",
   "Periods are aligned by choosing the nearest fiscal year-end; quarterly recalendarization (trailing twelve months) is not performed.",
   "When a figure was restated, the most recently filed value is used; earlier versions are not compared.",
+  "Missing figures mean missing from SEC Company Facts (structured XBRL data), not necessarily absent from the filing.",
 ];
+
 
 export function buildAudit(
   a: CompanyData,
   b: CompanyData,
   period: number | "latest",
-  opts: { auditId: string; now: Date },
+  opts: { auditId: string; now: Date; series?: SeriesScope },
 ): ComparabilityAudit {
   const p = choosePeriods(a, b, period);
-  const revenue = auditReported("revenue", a, b, p);
-  const opInc = auditReported("operating_income", a, b, p);
+  const revenue = auditReported("revenue", a, b, p, opts.series);
+  const opInc = auditReported("operating_income", a, b, p, opts.series);
   const margin = auditMargin(revenue, opInc);
-  const net = auditReported("net_income", a, b, p);
+  const net = auditReported("net_income", a, b, p, opts.series);
   const metrics = [revenue, opInc, margin, net];
 
   const insufficient = metrics.filter((m) => m.status === "INSUFFICIENT_EVIDENCE");
@@ -442,12 +585,24 @@ export function buildAudit(
   if (a.error) limitations.unshift(`${ta}: ${a.error}`);
   if (b.error) limitations.unshift(`${tb}: ${b.error}`);
 
+  const byReadiness = (r: Readiness) => metrics.filter((m) => m.integrity?.readiness === r);
+  // Display text only (the readiness values themselves are in readinessByMetric), worded with the shared labels.
+  const verdict =
+    (["READY", "REVIEW", "BLOCKED"] as Readiness[])
+      .filter((r) => byReadiness(r).length)
+      .map((r) => `${READINESS_LABEL[r]}: ${byReadiness(r).map((m) => m.label.toLowerCase()).join(", ")}.`)
+      .join(" ") + " Based only on the checks listed; accounting-policy equivalence is not assessed.";
+
+  const actions = metrics
+    .filter((m) => m.integrity && m.integrity.readiness !== "READY")
+    .map((m) => `${m.label}: ${m.integrity!.analystAction}`);
   const reviewChecklist = [
     "Open each linked 10-K and confirm the figures match the income statement.",
     ...(p.gapDays && p.gapDays > ALIGNED_DAYS ? [`Decide whether a ${p.gapDays}-day fiscal year-end gap is acceptable for this comparison.`] : []),
     ...(p.realigned ? [`Confirm the period realignment for ${tb} (nearest fiscal year rather than the matching label).`] : []),
     ...metrics.filter((m) => m.checks.some((c) => c.id === "definition" && !c.passed)).map((m) => `Reconcile the ${m.label.toLowerCase()} definitions between ${ta} and ${tb}.`),
     ...insufficient.map((m) => `Locate evidence for ${m.label.toLowerCase()} or exclude it from the comparison.`),
+    ...[...new Set(actions)],
     "Check the filings for one-time items (restructuring, impairments, divestitures) that distort operating results.",
   ];
 
@@ -464,5 +619,15 @@ export function buildAudit(
     reviewChecklist,
     partial: insufficient.length > 0,
     requiresHumanReview: metrics.some((m) => m.requiresHumanReview),
+    integrity: {
+      version: 2,
+      readinessByMetric: Object.fromEntries(metrics.map((m) => [m.metricId, m.integrity!.readiness])),
+      verdict,
+      coverage: [
+        "Assessed per metric: source evidence, currency, fiscal period alignment and length, XBRL concept, formula (derived metrics), source basis.",
+        "Revision signals: values of the audited year compared with earlier filings of the same concept and period; the reason for a change is not established.",
+        "Not assessed: accounting-policy and footnote equivalence, non-GAAP measures, segment data.",
+      ],
+    },
   };
 }

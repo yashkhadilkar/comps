@@ -2,7 +2,7 @@
 // changes it. Trigger, companies, metrics and period all come from the run's own structured trace and tables, so
 // there is no keyword matching on the question and no extra model call.
 import type { AgentResult, TraceStep } from "../agent/types";
-import { buildAudit, type CompanyData } from "./engine";
+import { buildAudit, type CompanyData, type SeriesScope } from "./engine";
 import { validateAudit, type AuditMetricId, type ComparabilityAudit, type ResearchAuditFinding, type ResearchAuditSummary } from "./types";
 
 export const RESEARCH_AUDIT_TIMEOUT_MS = 6_000;
@@ -101,19 +101,43 @@ export function planResearchAudit(result: AgentResult): ResearchAuditPlan | null
   };
 }
 
+// The series a research answer's trend checks cover: the years it shows, or "unknown" when it spans several it does
+// not name. Single-period research gets none, so multi-year checks are NOT_APPLICABLE.
+export function seriesScope(plan: ResearchAuditPlan): SeriesScope | undefined {
+  if (!plan.multiYear) return undefined;
+  return plan.yearsInResearch.length > 1 ? plan.yearsInResearch : "unknown";
+}
+
 export function summarize(plan: ResearchAuditPlan, audits: ComparabilityAudit[], extraLimits: string[] = []): ResearchAuditSummary {
   const findings: ResearchAuditFinding[] = audits.flatMap((a) =>
     a.metrics
       .filter((m) => plan.metrics.includes(m.metricId))
-      .map((m) => ({
-        pair: `${a.companies[0].ticker} vs ${a.companies[1].ticker}`,
-        metricId: m.metricId,
-        metric: m.label,
-        status: m.status,
-        explanation: m.caveats[0] ?? m.explanation,
-        evidenceUrls: [...new Set(m.values.flatMap((v) => v.evidence.map((e) => e.documentUrl)))],
-        requiresHumanReview: m.requiresHumanReview,
-      })),
+      .map((m) => {
+        const g = m.integrity;
+        return {
+          pair: `${a.companies[0].ticker} vs ${a.companies[1].ticker}`,
+          metricId: m.metricId,
+          metric: m.label,
+          status: m.status,
+          explanation: m.caveats[0] ?? m.explanation,
+          evidenceUrls: [...new Set(m.values.flatMap((v) => v.evidence.map((e) => e.documentUrl)))],
+          requiresHumanReview: m.requiresHumanReview,
+          ...(g
+            ? {
+                readiness: g.readiness,
+                conclusion: g.withheldConclusionReason ?? g.allowableConclusion ?? undefined,
+                analystAction: g.analystAction,
+                sourceBasis: g.sourceBasis,
+                checks: g.checks
+                  .filter((c) => c.status !== "PASS" && c.status !== "NOT_APPLICABLE")
+                  .map((c) => ({ id: c.id, status: c.status, title: c.title, finding: c.finding, ticker: c.ticker })),
+                passed: [...new Set(g.checks.filter((c) => c.status === "PASS").map((c) => c.title))],
+                notAssessed: g.coverage.notAssessed,
+                trend: g.trend,
+              }
+            : {}),
+        };
+      }),
   );
   const periodDetails = audits.map((a) => a.overallAssessment.split(":")[0]);
   const auditedPeriod = plan.period === "latest" ? "Latest fiscal year" : `FY${plan.period}`;
@@ -121,7 +145,10 @@ export function summarize(plan: ResearchAuditPlan, audits: ComparabilityAudit[],
   if (plan.multiYear) {
     const others = plan.yearsInResearch.filter((y) => y !== plan.period);
     limitations.push(
-      `This research covers ${others.length ? `other years (${others.map((y) => `FY${y}`).join(", ")})` : "several years"}; only ${auditedPeriod} was audited. Multi-year trends and growth rates were not checked.`,
+      `This research covers ${others.length ? `other years (${others.map((y) => `FY${y}`).join(", ")})` : "several years"}; only ${auditedPeriod} was audited across companies.` +
+        (others.length
+          ? " Each company's own annual series was checked for continuity, period length and concept changes; growth-rate calculations themselves were not re-verified."
+          : " Multi-year trends and growth rates were not checked."),
     );
   }
   const insufficient = findings.some((f) => f.status === "INSUFFICIENT_EVIDENCE");
@@ -180,7 +207,8 @@ export async function runResearchAudit(
     const has = (d: CompanyData, y: number) => d.metrics.revenue.some((r) => r.fiscalYear === y) || d.metrics.net_income.some((r) => r.fiscalYear === y);
     const common = plan.yearsInResearch.find((y) => data.every((d) => has(d, y)));
     if (typeof plan.period === "number" && common !== undefined && common !== plan.period) plan.period = common;
-    const audits = others.map((o, i) => buildAudit(anchor, o, plan.period, { auditId: `research-${i}`, now: opts.now ?? new Date() }));
+    const series = seriesScope(plan);
+    const audits = others.map((o, i) => buildAudit(anchor, o, plan.period, { auditId: `research-${i}`, now: opts.now ?? new Date(), series }));
     for (const a of audits) {
       const errors = validateAudit(a);
       if (errors.length) throw new Error(`contract violation: ${errors[0]}`);

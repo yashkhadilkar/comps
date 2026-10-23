@@ -15,13 +15,16 @@ async function main() {
   const a = res.body.audit;
   console.log(`overall ${a.overallStatus} partial=${a.partial}: ${a.overallAssessment}`);
   for (const m of a.metrics) {
-    console.log(`\n${m.label}: ${m.status} (${m.evidenceQuality})`);
+    console.log(`\n${m.label}: ${m.status} (${m.evidenceQuality}) readiness=${m.integrity?.readiness}`);
+    for (const c of m.integrity?.checks ?? []) if (c.status !== "PASS") console.log(`  [${c.status}] ${c.title}${c.ticker ? ` (${c.ticker})` : ""}: ${c.finding}`);
+    if (m.integrity) console.log(`  conclusion: ${m.integrity.withheldConclusionReason ?? m.integrity.allowableConclusion}\n  action: ${m.integrity.analystAction}`);
     for (const v of m.values) console.log(`  ${v.ticker} ${v.display ?? "—"} FY${v.fiscalYear} end ${v.periodEnd} src ${v.evidence.map((e) => `${e.accessionNumber} ${e.xbrlConcept} ${e.documentUrl}`).join("; ")}`);
     for (const ad of m.adjustments) console.log(`  adj[${ad.kind}] ${ad.formula} -> ${ad.outputValue}`);
     for (const c of m.caveats) console.log(`  caveat: ${c}`);
     for (const n of m.aiNotes) console.log(`  ai: ${n}`);
   }
-  console.log(`\nAI: ${a.aiInterpretation}`);
+  console.log(`\nverdict: ${a.integrity?.verdict}`);
+  console.log(`AI: ${a.aiInterpretation}`);
   console.log("limitations:", a.limitations);
   console.log("checklist:", a.reviewChecklist);
 }

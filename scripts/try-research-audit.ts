@@ -111,7 +111,13 @@ async function main() {
   const oi = summary?.findings.find((f) => f.metricId === "operating_income");
   check("R06 missing Nike operating income -> INSUFFICIENT_EVIDENCE caution", oi?.status === "INSUFFICIENT_EVIDENCE" && oi.explanation.includes("NKE") && summary?.status === "partial", oi);
   const rev = summary?.findings.find((f) => f.metricId === "revenue");
-  check("R06 fiscal year-end gap is a caution with SEC evidence", rev?.status === "PARTIALLY_COMPARABLE" && rev.explanation.includes("days apart") && rev.evidenceUrls.every((u) => u.startsWith("https://www.sec.gov/")), rev);
+  // V2: two full annual periods 61 days apart are an ordinary fiscal-calendar difference (INFO, disclosed), not a
+  // partial comparison. Was PARTIALLY_COMPARABLE before V2.
+  check(
+    "R06 61-day fiscal year-end gap is disclosed as INFO timing, still comparable, with SEC evidence",
+    rev?.status === "COMPARABLE" && rev.explanation.includes("days apart") && rev.checks?.some((c) => c.id === "period_alignment" && c.status === "INFO") === true && rev.evidenceUrls.every((u) => u.startsWith("https://www.sec.gov/")),
+    rev,
+  );
   check("R06 period details explicit", summary?.periodDetails[0] === "NKE FY2024 (ended 2024-05-31) vs UAA FY2024 (ended 2024-03-31)", summary?.periodDetails);
 
   // 8 / 9: never alters the answer

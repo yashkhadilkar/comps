@@ -1,6 +1,7 @@
 // Financial comparability audit contract (docs/COMPS_AUDIT_SPRINT.md section 2). An evidence-backed comparability
 // review of two companies' reported metrics, NOT a statutory audit. Every number here comes from SEC XBRL facts or
 // from the calculate engine; the model never supplies a figure, an adjustment or a status.
+import { checkSeverity, reduceReadiness, sourceBasisOf } from "./readiness";
 
 export const COMPARABILITY_STATUSES = [
   "COMPARABLE",
@@ -16,6 +17,74 @@ export type EvidenceQuality = (typeof EVIDENCE_QUALITIES)[number];
 
 export const AUDIT_METRICS = ["revenue", "operating_income", "operating_margin", "net_income"] as const;
 export type AuditMetricId = (typeof AUDIT_METRICS)[number];
+
+// ---- Comparison integrity (V2, docs/COMPS_COMPARISON_INTEGRITY_V2.md) -------------------------------------------
+// A second, independent dimension next to the comparability status: whether the analyst's comparative conclusion
+// can be drawn. Every value is set by lib/audit/integrity.ts from deterministic checks; optional on every type so
+// audits and research summaries saved before V2 still parse and render.
+
+export const READINESS = ["READY", "REVIEW", "BLOCKED"] as const;
+export type Readiness = (typeof READINESS)[number];
+
+export const CHECK_STATUSES = ["PASS", "INFO", "CAUTION", "FAIL", "NOT_ASSESSED", "NOT_APPLICABLE"] as const;
+export type CheckStatus = (typeof CHECK_STATUSES)[number];
+
+export const SOURCE_BASES = ["DIRECT_REPORTED", "DERIVED", "UNAVAILABLE"] as const;
+export type SourceBasis = (typeof SOURCE_BASES)[number];
+
+export type CheckSeverity = "informational" | "material" | "blocking";
+
+export const INTEGRITY_CHECK_IDS = [
+  "evidence",
+  "currency",
+  "period_alignment",
+  "period_duration",
+  "definition",
+  "formula",
+  "provenance",
+  "series_continuity",
+  "tag_lineage",
+  "revisions",
+  "accounting_policy",
+] as const;
+export type IntegrityCheckId = (typeof INTEGRITY_CHECK_IDS)[number];
+
+// A filing that supports a finding but is not one of the metric's value sources (an earlier year, a transition report).
+export type CheckReference = { label: string; url: string; accession: string };
+
+export type IntegrityCheck = {
+  id: IntegrityCheckId;
+  scope: "comparison" | "history"; // cross-company check vs one company's own multi-year series
+  ticker: string | null; // set for single-company (history) checks
+  critical: boolean; // a critical check that is not assessed prevents READY
+  status: CheckStatus;
+  severity: CheckSeverity; // derived from status + critical, never set independently
+  title: string;
+  finding: string; // the fact
+  implication: string; // what it means for the conclusion
+  evidenceIds: string[]; // sourceIds of this metric's evidence; empty when the finding is about missing evidence
+  references?: CheckReference[];
+  action: string | null;
+};
+
+export type MetricIntegrity = {
+  version: 2;
+  readiness: Readiness; // for the single-period cross-company comparison of this metric
+  checks: IntegrityCheck[];
+  coverage: { assessed: string[]; notAssessed: string[]; notApplicable: string[] };
+  sourceBasis: Record<string, SourceBasis>; // ticker -> basis
+  analystAction: string;
+  allowableConclusion: string | null;
+  withheldConclusionReason: string | null;
+  trend: { readiness: Readiness; summary: string } | null; // only when a multi-year series is in scope
+};
+
+export type AuditIntegrity = {
+  version: 2;
+  readinessByMetric: Partial<Record<AuditMetricId, Readiness>>;
+  verdict: string;
+  coverage: string[];
+};
 
 export type AuditCompany = { ticker: string; name: string; cik: number };
 
@@ -40,8 +109,10 @@ export type AuditValue = {
   unit: string; // "USD" or "percent"
   fiscalYear: number | null;
   periodEnd: string | null;
+  periodStart?: string | null; // V2: from the XBRL fact's context; null when not retrieved
   periodType: "annual";
   reportingBasis: "US GAAP (as reported, XBRL)" | "Derived from US GAAP inputs";
+  sourceBasis?: SourceBasis; // V2
   evidence: AuditEvidence[];
 };
 
@@ -76,6 +147,7 @@ export type MetricAudit = {
   explanation: string;
   requiresHumanReview: boolean;
   aiNotes: string[]; // bounded model interpretation, already validated; never changes status or figures
+  integrity?: MetricIntegrity; // V2; absent on audits built before it
 };
 
 export type ComparabilityAudit = {
@@ -91,6 +163,7 @@ export type ComparabilityAudit = {
   reviewChecklist: string[];
   partial: boolean; // true when at least one metric could not be audited
   requiresHumanReview: boolean;
+  integrity?: AuditIntegrity; // V2
 };
 
 // ---- Runtime validation -------------------------------------------------------------------------------------------
@@ -139,7 +212,29 @@ export function validateAudit(a: unknown): string[] {
     if (missing && m.status !== "INSUFFICIENT_EVIDENCE" && m.status !== "NOT_COMPARABLE") {
       errors.push(`${where}: missing value but status ${m.status}`);
     }
+    if (m.integrity) errors.push(...validateIntegrity(m, evidenceIds, missing).map((e) => `${where}: ${e}`));
   }
+  return errors;
+}
+
+// V2 invariants: readiness is exactly what the reducer derives from the checks (so neither the model nor a later
+// edit can upgrade it), severities follow statuses, and every evidence ID / reference is real.
+function validateIntegrity(m: MetricAudit, evidenceIds: Set<string>, missing: boolean): string[] {
+  const errors: string[] = [];
+  const g = m.integrity!;
+  if (!isIn(READINESS, g.readiness)) return ["bad readiness"];
+  for (const c of g.checks) {
+    if (!isIn(INTEGRITY_CHECK_IDS, c.id) || !isIn(CHECK_STATUSES, c.status)) errors.push(`bad check ${c.id}/${c.status}`);
+    else if (c.severity !== checkSeverity(c.status, c.critical)) errors.push(`check ${c.id}: severity does not match status`);
+    if (c.evidenceIds.some((id) => !evidenceIds.has(id))) errors.push(`check ${c.id} cites evidence not in this metric`);
+    if ((c.references ?? []).some((r) => !/^https:\/\/www\.sec\.gov\//.test(r.url))) errors.push(`check ${c.id}: non-SEC reference`);
+  }
+  if (g.readiness !== reduceReadiness(g.checks.filter((c) => c.scope === "comparison"))) errors.push("readiness does not follow from its checks");
+  if ((missing || m.status === "INSUFFICIENT_EVIDENCE" || m.status === "NOT_COMPARABLE") && g.readiness !== "BLOCKED") {
+    errors.push(`status ${m.status} must be BLOCKED`);
+  }
+  for (const v of m.values) if (g.sourceBasis[v.ticker] !== sourceBasisOf(v)) errors.push(`${v.ticker}: source basis does not match its value`);
+  if (g.readiness === "BLOCKED" ? !g.withheldConclusionReason : !g.allowableConclusion) errors.push("conclusion text missing");
   return errors;
 }
 
@@ -174,6 +269,9 @@ export function parseAuditRequest(body: unknown): { ok: true; value: AuditReques
 // A compact, deterministic summary of the audit attached to a research answer (never part of final_answer). Built
 // from ComparabilityAudit results; saved in runs.trace.audit and sent as the optional `audit` stream event.
 
+// One check outcome as carried in a research summary (compact: no implication text or evidence IDs).
+export type ResearchFindingCheck = { id: IntegrityCheckId; status: CheckStatus; title: string; finding: string; ticker: string | null };
+
 export type ResearchAuditFinding = {
   pair: string; // "NKE vs UAA"
   metricId: AuditMetricId;
@@ -182,6 +280,15 @@ export type ResearchAuditFinding = {
   explanation: string;
   evidenceUrls: string[];
   requiresHumanReview: boolean;
+  // V2, absent on summaries saved before it (the panel then falls back to the comparability status alone)
+  readiness?: Readiness;
+  conclusion?: string; // allowable conclusion, or why it is withheld
+  analystAction?: string;
+  sourceBasis?: Record<string, SourceBasis>;
+  checks?: ResearchFindingCheck[]; // every check that did not plainly pass
+  passed?: string[]; // titles of checks that passed
+  notAssessed?: string[];
+  trend?: { readiness: Readiness; summary: string } | null;
 };
 
 export type ResearchAuditSummary = {
@@ -197,6 +304,28 @@ export type ResearchAuditSummary = {
 };
 
 const RA_STATUSES = ["completed", "partial", "unavailable"] as const;
+
+// V2 fields are all-or-nothing: without a valid readiness none are kept, so a damaged summary renders as legacy.
+function readV2Finding(x: Record<string, unknown>): Partial<ResearchAuditFinding> {
+  if (!isIn(READINESS, x.readiness)) return {};
+  const checks = (Array.isArray(x.checks) ? x.checks : []).flatMap((c): ResearchFindingCheck[] => {
+    const o = c as Record<string, unknown>;
+    if (!o || !isIn(INTEGRITY_CHECK_IDS, o.id) || !isIn(CHECK_STATUSES, o.status) || !isStr(o.title) || !isStr(o.finding)) return [];
+    return [{ id: o.id, status: o.status, title: o.title, finding: o.finding, ticker: isStr(o.ticker) ? o.ticker : null }];
+  });
+  const basis = (x.sourceBasis ?? {}) as Record<string, unknown>;
+  const t = x.trend as Record<string, unknown> | null | undefined;
+  return {
+    readiness: x.readiness,
+    conclusion: isStr(x.conclusion) ? x.conclusion : undefined,
+    analystAction: isStr(x.analystAction) ? x.analystAction : undefined,
+    sourceBasis: Object.fromEntries(Object.entries(basis).filter(([, v]) => isIn(SOURCE_BASES, v))) as Record<string, SourceBasis>,
+    checks,
+    passed: strs(x.passed),
+    notAssessed: strs(x.notAssessed),
+    trend: t && isIn(READINESS, t.readiness) && isStr(t.summary) ? { readiness: t.readiness, summary: t.summary } : null,
+  };
+}
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter(isStr) : []);
 
 // Tolerant reader for persisted or streamed summaries: anything malformed is dropped rather than shown.
@@ -215,6 +344,7 @@ export function toResearchAudit(v: unknown): ResearchAuditSummary | null {
         explanation: x.explanation,
         evidenceUrls: strs(x.evidenceUrls).filter((u) => /^https:\/\/www\.sec\.gov\//.test(u)),
         requiresHumanReview: x.requiresHumanReview === true,
+        ...readV2Finding(x),
       },
     ];
   });

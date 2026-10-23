@@ -355,7 +355,7 @@ Preserve the existing behavior. Don't change the model, prompts or tools as part
 | Integration | Used by | What to check in production |
 |---|---|---|
 | Anthropic (`@anthropic-ai/sdk`) | Agent loop (60 s per model call, 1 SDK retry); `/audit` explanatory note (one bounded call). The comparability review inside research answers makes **no** model call | `ANTHROPIC_API_KEY` is valid, has credit and a spend limit; `LLM_MODEL` is a valid model id. A bad key shows as an error event in the stream and `[api/agent]` lines in the logs |
-| SEC EDGAR (`data.sec.gov` companyfacts, `www.sec.gov` ticker list) | `get_financials`, `lookup_company`, the comparability audit | `SEC_USER_AGENT` = name + email. SEC allows about 10 requests/s per client; a few companies per question stays well under that. Responses are cached **in memory** (TTL, bounded), so the cache empties on every deploy or restart and the first question after a deploy is slower |
+| SEC EDGAR (`data.sec.gov` companyfacts, `www.sec.gov` ticker list) | `lookup_ticker`, `get_financials`, the comparability audit | `SEC_USER_AGENT` = name + email. SEC allows about 10 requests/s per client; a few companies per question stays well under that. Responses are cached **in memory** (TTL, bounded), so the cache empties on every deploy or restart and the first question after a deploy is slower |
 | Tavily | `search_news` | `TAVILY_API_KEY` is valid. News text is wrapped as untrusted data |
 | Comparability audit | `lib/audit/` | Needs only SEC data, plus Anthropic for the optional `/audit` note. Rate limit: 10 audits per user per hour, in memory per process |
 
